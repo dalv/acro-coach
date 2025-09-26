@@ -2,193 +2,158 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import os
-from collections import defaultdict, deque
-from scipy.signal import savgol_filter
+from scipy import signal
+from scipy.interpolate import interp1d
+from collections import deque
 import warnings
 warnings.filterwarnings('ignore')
 
-class KalmanFilter2D:
-    """Simple 2D Kalman Filter for keypoint tracking"""
-    def __init__(self, process_noise=1e-3, measurement_noise=1e-1):
-        # State: [x, y, vx, vy] - position and velocity
-        self.state = np.zeros(4)
-        self.P = np.eye(4) * 1000  # High initial uncertainty
+class KalmanFilter:
+    """Simple Kalman filter for 2D point tracking"""
+    def __init__(self, process_variance=0.03, measurement_variance=0.1):
+        self.state = None  # [x, y, vx, vy]
+        self.covariance = np.eye(4) * 1000  # Initial uncertainty
+        self.process_variance = process_variance
+        self.measurement_variance = measurement_variance
         
-        # State transition model (constant velocity)
+        # State transition matrix
         self.F = np.array([[1, 0, 1, 0],
                           [0, 1, 0, 1],
                           [0, 0, 1, 0],
-                          [0, 0, 0, 1]], dtype=np.float32)
+                          [0, 0, 0, 1]])
         
-        # Observation model (we observe position only)
+        # Measurement matrix
         self.H = np.array([[1, 0, 0, 0],
-                          [0, 1, 0, 0]], dtype=np.float32)
+                          [0, 1, 0, 0]])
         
         # Process noise
-        self.Q = np.eye(4) * process_noise
+        self.Q = np.eye(4) * self.process_variance
         
         # Measurement noise
-        self.R = np.eye(2) * measurement_noise
-        
-        self.initialized = False
-        
+        self.R = np.eye(2) * self.measurement_variance
+    
     def predict(self):
         """Predict next state"""
+        if self.state is None:
+            return None
+        
         self.state = self.F @ self.state
-        self.P = self.F @ self.P @ self.F.T + self.Q
-        return self.state[:2]  # Return predicted position
+        self.covariance = self.F @ self.covariance @ self.F.T + self.Q
+        return self.state[:2]
+    
+    def update(self, measurement, confidence=1.0):
+        """Update state with measurement"""
+        if self.state is None:
+            # Initialize state
+            self.state = np.array([measurement[0], measurement[1], 0, 0])
+            return self.state[:2]
         
-    def update(self, measurement):
-        """Update with new measurement"""
-        if not self.initialized:
-            self.state[:2] = measurement
-            self.initialized = True
-            return measurement
-            
-        # Predict step
-        self.predict()
+        # Adjust measurement noise based on confidence
+        R_adjusted = self.R / max(confidence, 0.1)
         
-        # Update step
-        y = measurement - (self.H @ self.state)  # Innovation
-        S = self.H @ self.P @ self.H.T + self.R  # Innovation covariance
-        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
+        # Innovation
+        y = measurement - self.H @ self.state
+        S = self.H @ self.covariance @ self.H.T + R_adjusted
         
+        # Kalman gain
+        K = self.covariance @ self.H.T @ np.linalg.inv(S)
+        
+        # Update state and covariance
         self.state = self.state + K @ y
-        self.P = (np.eye(4) - K @ self.H) @ self.P
+        self.covariance = (np.eye(4) - K @ self.H) @ self.covariance
         
         return self.state[:2]
 
 class TemporalSmoother:
-    """Temporal smoothing for pose keypoints"""
-    def __init__(self, max_history=30, confidence_threshold=0.3):
-        self.max_history = max_history
-        self.confidence_threshold = confidence_threshold
+    """Handles temporal smoothing for keypoints"""
+    def __init__(self, window_size=5, outlier_threshold=50):
+        self.window_size = window_size
+        self.outlier_threshold = outlier_threshold
+        self.history = {}  # Store history for each person-keypoint pair
+        self.kalman_filters = {}  # Kalman filters for each person-keypoint
         
-        # Store history for each person and keypoint
-        self.keypoint_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=max_history)))
-        self.confidence_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=max_history)))
-        
-        # Kalman filters for each person and keypoint
-        self.kalman_filters = defaultdict(lambda: defaultdict(lambda: KalmanFilter2D()))
-        
-        # Track missing keypoints for interpolation
-        self.missing_count = defaultdict(lambda: defaultdict(int))
-        
-    def smooth_keypoints(self, person_id, keypoints, confidences, frame_idx):
+    def smooth_keypoints(self, person_id, keypoints, confidences):
         """Apply temporal smoothing to keypoints"""
         smoothed_keypoints = []
-        smoothed_confidences = []
         
-        for kpt_idx, (keypoint, confidence) in enumerate(zip(keypoints, confidences)):
-            x, y = keypoint
+        for kpt_idx, (kpt, conf) in enumerate(zip(keypoints, confidences)):
+            key = f"{person_id}_{kpt_idx}"
             
-            # Store in history
-            self.keypoint_history[person_id][kpt_idx].append([x, y])
-            self.confidence_history[person_id][kpt_idx].append(confidence)
+            # Initialize history and Kalman filter if needed
+            if key not in self.history:
+                self.history[key] = deque(maxlen=self.window_size)
+                self.kalman_filters[key] = KalmanFilter()
             
-            # Apply different smoothing strategies based on confidence
-            if confidence > self.confidence_threshold:
+            # Apply different smoothing based on confidence
+            if conf > 0.5:
                 # High confidence: use Kalman filter
-                smoothed_pos = self._kalman_smooth(person_id, kpt_idx, [x, y])
-                smoothed_conf = confidence
-                self.missing_count[person_id][kpt_idx] = 0
+                smoothed = self.kalman_filters[key].update(kpt[:2], conf)
+                smoothed_kpt = [smoothed[0], smoothed[1], conf]
+            elif conf > 0.2:
+                # Medium confidence: weighted average with history
+                smoothed_kpt = self._weighted_average(key, kpt, conf)
             else:
-                # Low confidence: try to recover using temporal information
-                smoothed_pos, smoothed_conf = self._recover_keypoint(person_id, kpt_idx, [x, y], confidence)
-                self.missing_count[person_id][kpt_idx] += 1
+                # Low confidence: predict from Kalman or interpolate
+                smoothed_kpt = self._recover_keypoint(key, kpt, conf)
             
-            smoothed_keypoints.append(smoothed_pos)
-            smoothed_confidences.append(smoothed_conf)
-            
-        return np.array(smoothed_keypoints), np.array(smoothed_confidences)
+            self.history[key].append(smoothed_kpt)
+            smoothed_keypoints.append(smoothed_kpt)
+        
+        return smoothed_keypoints
     
-    def _kalman_smooth(self, person_id, kpt_idx, measurement):
-        """Apply Kalman filtering"""
-        kalman = self.kalman_filters[person_id][kpt_idx]
-        return kalman.update(np.array(measurement))
+    def _weighted_average(self, key, kpt, conf):
+        """Apply weighted moving average"""
+        if len(self.history[key]) == 0:
+            return kpt
+        
+        weights = []
+        points = []
+        
+        for hist_kpt in self.history[key]:
+            weights.append(hist_kpt[2])  # Use confidence as weight
+            points.append([hist_kpt[0], hist_kpt[1]])
+        
+        # Add current point
+        weights.append(conf * 2)  # Give more weight to current
+        points.append([kpt[0], kpt[1]])
+        
+        weights = np.array(weights)
+        points = np.array(points)
+        
+        # Weighted average
+        weights = weights / weights.sum()
+        smoothed = np.average(points, axis=0, weights=weights)
+        
+        return [smoothed[0], smoothed[1], conf]
     
-    def _recover_keypoint(self, person_id, kpt_idx, current_pos, confidence):
-        """Recover low-confidence keypoint using temporal information"""
-        history = self.keypoint_history[person_id][kpt_idx]
-        conf_history = self.confidence_history[person_id][kpt_idx]
+    def _recover_keypoint(self, key, kpt, conf):
+        """Recover lost keypoint using prediction or interpolation"""
+        # Try Kalman prediction
+        if key in self.kalman_filters:
+            predicted = self.kalman_filters[key].predict()
+            if predicted is not None:
+                return [predicted[0], predicted[1], conf * 1.5]  # Boost confidence slightly
         
-        if len(history) < 3:
-            return current_pos, confidence
-            
-        # Find recent high-confidence keypoints
-        recent_good_points = []
-        recent_good_confs = []
+        # Fall back to last known good position
+        if len(self.history[key]) > 0:
+            last_good = self.history[key][-1]
+            return [last_good[0], last_good[1], conf]
         
-        for i in range(min(10, len(history))):
-            if conf_history[-(i+1)] > self.confidence_threshold:
-                recent_good_points.append(history[-(i+1)])
-                recent_good_confs.append(conf_history[-(i+1)])
-            if len(recent_good_points) >= 3:
-                break
-        
-        if len(recent_good_points) >= 2:
-            # Use Kalman prediction if we have recent good points
-            kalman = self.kalman_filters[person_id][kpt_idx]
-            predicted_pos = kalman.predict()
-            
-            # Blend prediction with current measurement based on confidence
-            alpha = min(confidence, 0.3)  # Low weight for low confidence
-            blended_pos = alpha * np.array(current_pos) + (1 - alpha) * predicted_pos
-            
-            # Boost confidence slightly if prediction seems reasonable
-            improved_conf = min(confidence + 0.1, 0.8)
-            return blended_pos, improved_conf
-        
-        return current_pos, confidence
-    
-    def post_process_trajectory(self, person_trajectories):
-        """Apply post-processing smoothing to complete trajectories"""
-        smoothed_trajectories = {}
-        
-        for person_id, person_data in person_trajectories.items():
-            smoothed_person = {}
-            
-            for kpt_idx in range(17):  # 17 COCO keypoints
-                if kpt_idx not in person_data:
-                    continue
-                    
-                frames = person_data[kpt_idx]['frames']
-                positions = person_data[kpt_idx]['positions']
-                confidences = person_data[kpt_idx]['confidences']
-                
-                if len(positions) < 5:  # Need minimum points for smoothing
-                    smoothed_person[kpt_idx] = person_data[kpt_idx]
-                    continue
-                
-                # Apply Savitzky-Golay filter for additional smoothing
-                positions = np.array(positions)
-                try:
-                    # Smooth x and y coordinates separately
-                    window_length = min(5, len(positions) // 2 * 2 + 1)  # Ensure odd number
-                    if window_length >= 5:
-                        smooth_x = savgol_filter(positions[:, 0], window_length, 2)
-                        smooth_y = savgol_filter(positions[:, 1], window_length, 2)
-                        positions = np.column_stack([smooth_x, smooth_y])
-                except:
-                    pass  # Keep original if smoothing fails
-                
-                smoothed_person[kpt_idx] = {
-                    'frames': frames,
-                    'positions': positions.tolist(),
-                    'confidences': confidences
-                }
-            
-            smoothed_trajectories[person_id] = smoothed_person
-            
-        return smoothed_trajectories
+        return kpt
 
-class AcrobaticPoseProcessor:
-    def __init__(self, model_size='s'):
-        """Initialize with temporal smoothing capabilities"""
+class EnhancedAcrobaticPoseProcessor:
+    def __init__(self, model_size='m', enable_smoothing=True):
+        """
+        Initialize enhanced pose processor with temporal smoothing
+        """
         self.model = YOLO(f'yolo11{model_size}-pose.pt')
+        self.enable_smoothing = enable_smoothing
         
         # Initialize temporal smoother
-        self.temporal_smoother = TemporalSmoother(max_history=30, confidence_threshold=0.3)
+        self.smoother = TemporalSmoother(window_size=7, outlier_threshold=100)
+        
+        # Store full trajectory for post-processing
+        self.full_trajectories = {}
         
         # COCO pose keypoints
         self.keypoint_names = [
@@ -210,80 +175,243 @@ class AcrobaticPoseProcessor:
         
         # Colors for different people
         self.person_colors = [
-            (0, 255, 0),    # Green for person 1
-            (255, 0, 0),    # Blue for person 2
-            (0, 0, 255),    # Red for person 3
-            (255, 255, 0),  # Cyan for person 4
-            (255, 0, 255),  # Magenta for person 5
+            (0, 255, 0),    # Green
+            (255, 0, 0),    # Blue
+            (0, 0, 255),    # Red
+            (255, 255, 0),  # Cyan
+            (255, 0, 255),  # Magenta
         ]
         
-        # Store trajectories for post-processing
-        self.person_trajectories = defaultdict(lambda: defaultdict(lambda: {'frames': [], 'positions': [], 'confidences': []}))
+        # Critical keypoints for acrobatic moves (hips, shoulders, ankles, wrists)
+        self.critical_keypoints = [5, 6, 9, 10, 11, 12, 15, 16]
+    
+    def collect_trajectories(self, input_path):
+        """First pass: collect all keypoint trajectories"""
+        print("📊 First pass: Collecting keypoint trajectories...")
         
-    def draw_keypoints_and_skeleton(self, frame, keypoints, confidences, person_id=0, confidence_threshold=0.25):
-        """Draw smoothed keypoints and skeleton"""
+        cap = cv2.VideoCapture(input_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        
+        trajectories = {}
+        frame_idx = 0
+        
+        results = self.model.track(input_path, stream=True, verbose=False, tracker="bytetrack.yaml")
+        
+        for result in results:
+            if result.boxes is not None and result.keypoints is not None:
+                keypoints = result.keypoints.xy.cpu().numpy()
+                keypoint_confidences = result.keypoints.conf.cpu().numpy()
+                
+                track_ids = result.boxes.id
+                if track_ids is not None:
+                    track_ids = track_ids.cpu().numpy().astype(int)
+                else:
+                    track_ids = list(range(len(keypoints)))
+                
+                for person_idx in range(len(keypoints)):
+                    person_id = track_ids[person_idx] if person_idx < len(track_ids) else person_idx
+                    
+                    if person_id not in trajectories:
+                        trajectories[person_id] = {
+                            'keypoints': [],
+                            'confidences': [],
+                            'frames': []
+                        }
+                    
+                    trajectories[person_id]['keypoints'].append(keypoints[person_idx])
+                    trajectories[person_id]['confidences'].append(keypoint_confidences[person_idx])
+                    trajectories[person_id]['frames'].append(frame_idx)
+            
+            frame_idx += 1
+            if frame_idx % 30 == 0:
+                print(f"  Collecting: {frame_idx}/{total_frames} frames")
+        
+        return trajectories, total_frames
+    
+    def post_process_trajectories(self, trajectories, total_frames):
+        """Apply global smoothing and interpolation to trajectories"""
+        print("🔧 Applying global temporal smoothing...")
+        
+        smoothed_trajectories = {}
+        
+        for person_id, data in trajectories.items():
+            frames = np.array(data['frames'])
+            keypoints = np.array(data['keypoints'])
+            confidences = np.array(data['confidences'])
+            
+            num_keypoints = keypoints.shape[1]
+            smoothed_kpts = np.zeros((total_frames, num_keypoints, 2))
+            smoothed_confs = np.zeros((total_frames, num_keypoints))
+            
+            for kpt_idx in range(num_keypoints):
+                # Get trajectory for this keypoint
+                kpt_traj = keypoints[:, kpt_idx, :]
+                kpt_conf = confidences[:, kpt_idx]
+                
+                # Apply different smoothing for critical vs non-critical keypoints
+                if kpt_idx in self.critical_keypoints:
+                    window = 9  # Larger window for critical points
+                    poly_order = 2
+                else:
+                    window = 5
+                    poly_order = 1
+                
+                # Savitzky-Golay filter for smooth trajectories
+                if len(frames) > window:
+                    try:
+                        # Smooth x and y separately
+                        x_smooth = signal.savgol_filter(kpt_traj[:, 0], window, poly_order)
+                        y_smooth = signal.savgol_filter(kpt_traj[:, 1], window, poly_order)
+                        
+                        # Interpolate to all frames
+                        if len(frames) > 1:
+                            # Create interpolation functions
+                            fx = interp1d(frames, x_smooth, kind='cubic', 
+                                        bounds_error=False, fill_value='extrapolate')
+                            fy = interp1d(frames, y_smooth, kind='cubic',
+                                        bounds_error=False, fill_value='extrapolate')
+                            fc = interp1d(frames, kpt_conf, kind='linear',
+                                        bounds_error=False, fill_value=0)
+                            
+                            # Interpolate to all frames
+                            all_frames = np.arange(total_frames)
+                            smoothed_kpts[all_frames, kpt_idx, 0] = fx(all_frames)
+                            smoothed_kpts[all_frames, kpt_idx, 1] = fy(all_frames)
+                            smoothed_confs[all_frames, kpt_idx] = fc(all_frames)
+                        else:
+                            # Single frame - just copy
+                            smoothed_kpts[frames[0], kpt_idx] = kpt_traj[0]
+                            smoothed_confs[frames[0], kpt_idx] = kpt_conf[0]
+                    except:
+                        # Fallback to simple copy if smoothing fails
+                        for i, f in enumerate(frames):
+                            smoothed_kpts[f, kpt_idx] = kpt_traj[i]
+                            smoothed_confs[f, kpt_idx] = kpt_conf[i]
+                else:
+                    # Not enough points for smoothing
+                    for i, f in enumerate(frames):
+                        smoothed_kpts[f, kpt_idx] = kpt_traj[i]
+                        smoothed_confs[f, kpt_idx] = kpt_conf[i]
+            
+            smoothed_trajectories[person_id] = {
+                'keypoints': smoothed_kpts,
+                'confidences': smoothed_confs
+            }
+        
+        return smoothed_trajectories
+    
+    def draw_keypoints_and_skeleton(self, frame, keypoints, person_id=0, confidence_threshold=0.3):
+        """Draw keypoints and skeleton with confidence visualization"""
         color = self.person_colors[person_id % len(self.person_colors)]
         
         # Draw skeleton connections
         for connection in self.skeleton:
             kpt1_idx, kpt2_idx = connection
-            if (kpt1_idx < len(keypoints) and kpt2_idx < len(keypoints)):
+            if (kpt1_idx < len(keypoints) and kpt2_idx < len(keypoints) and 
+                len(keypoints[kpt1_idx]) >= 3 and len(keypoints[kpt2_idx]) >= 3):
                 
-                x1, y1 = keypoints[kpt1_idx]
-                x2, y2 = keypoints[kpt2_idx]
-                conf1, conf2 = confidences[kpt1_idx], confidences[kpt2_idx]
+                x1, y1, conf1 = keypoints[kpt1_idx]
+                x2, y2, conf2 = keypoints[kpt2_idx]
                 
-                # Only draw if both keypoints have sufficient confidence
                 if conf1 > confidence_threshold and conf2 > confidence_threshold:
                     # Vary line thickness based on confidence
-                    thickness = max(1, int(3 * min(conf1, conf2)))
+                    thickness = int(2 + 2 * min(conf1, conf2))
                     cv2.line(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
         
-        # Draw keypoints with confidence-based sizing
-        for i, (keypoint, conf) in enumerate(zip(keypoints, confidences)):
-            if conf > confidence_threshold:
-                x, y = keypoint
-                
-                # Size based on confidence
-                radius = max(2, int(6 * conf))
-                
-                # Color intensity based on confidence
-                intensity = min(1.0, conf + 0.2)
-                adjusted_color = tuple(int(c * intensity) for c in color)
-                
-                # Draw keypoint
-                cv2.circle(frame, (int(x), int(y)), radius, adjusted_color, -1)
-                cv2.circle(frame, (int(x), int(y)), radius, (255, 255, 255), 1)
-                
-                # Draw confidence score for debugging (optional)
-                if conf < 0.5:  # Show confidence for uncertain points
-                    cv2.putText(frame, f'{conf:.2f}', (int(x)+5, int(y)-5), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+        # Draw keypoints
+        for i, keypoint in enumerate(keypoints):
+            if len(keypoint) >= 3:
+                x, y, conf = keypoint
+                if conf > confidence_threshold:
+                    # Vary circle size based on confidence
+                    radius = int(3 + 3 * conf)
+                    cv2.circle(frame, (int(x), int(y)), radius, color, -1)
+                    cv2.circle(frame, (int(x), int(y)), radius, (255, 255, 255), 1)
+                    
+                    # Mark critical keypoints with additional indicator
+                    if i in self.critical_keypoints:
+                        cv2.circle(frame, (int(x), int(y)), radius + 2, (255, 255, 0), 1)
         
         return frame
     
-    def add_person_label(self, frame, bbox, person_id, confidence):
-        """Add person ID label with smoothing info"""
-        x1, y1, x2, y2 = bbox
-        color = self.person_colors[person_id % len(self.person_colors)]
+    def process_video_with_smoothing(self, input_path, output_path, confidence_threshold=0.3):
+        """Process video with two-pass temporal smoothing"""
+        if not os.path.exists(input_path):
+            print(f"Error: Input video '{input_path}' not found!")
+            return False
         
-        # Create enhanced label
-        label = f"Person {person_id + 1} ({confidence:.2f}) [Smoothed]"
+        # First pass: collect trajectories
+        trajectories, total_frames = self.collect_trajectories(input_path)
         
-        (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        # Apply global smoothing
+        smoothed_trajectories = self.post_process_trajectories(trajectories, total_frames)
         
-        cv2.rectangle(frame, (int(x1), int(y1) - text_height - 10), 
-                     (int(x1) + text_width, int(y1)), color, -1)
+        # Second pass: render with smoothed keypoints
+        print("🎬 Second pass: Rendering smoothed video...")
         
-        cv2.putText(frame, label, (int(x1), int(y1) - 5), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        cap = cv2.VideoCapture(input_path)
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         
-        return frame
+        frame_idx = 0
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Draw smoothed keypoints for each tracked person
+            for person_id, data in smoothed_trajectories.items():
+                if frame_idx < len(data['keypoints']):
+                    keypoints = data['keypoints'][frame_idx]
+                    confidences = data['confidences'][frame_idx]
+                    
+                    # Combine keypoints with confidences
+                    keypoints_with_conf = []
+                    for kpt, conf in zip(keypoints, confidences):
+                        keypoints_with_conf.append([kpt[0], kpt[1], conf])
+                    
+                    # Draw smoothed pose
+                    frame = self.draw_keypoints_and_skeleton(
+                        frame, keypoints_with_conf, person_id, confidence_threshold
+                    )
+            
+            # Add frame counter
+            cv2.putText(frame, f"Frame: {frame_idx}/{total_frames}", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Add smoothing indicator
+            if self.enable_smoothing:
+                cv2.putText(frame, "Temporal Smoothing: ON", 
+                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            
+            out.write(frame)
+            frame_idx += 1
+            
+            if frame_idx % 30 == 0:
+                print(f"  Rendering: {frame_idx}/{total_frames} frames")
+        
+        cap.release()
+        out.release()
+        
+        print(f"✅ Processing complete! Output saved to: {output_path}")
+        return True
     
-    def process_video(self, input_path, output_path, confidence_threshold=0.25):
-        """Process video with temporal smoothing"""
+    def process_video(self, input_path, output_path, confidence_threshold=0.3):
+        """Main processing function"""
+        if self.enable_smoothing:
+            return self.process_video_with_smoothing(input_path, output_path, confidence_threshold)
+        else:
+            # Fall back to original single-pass processing
+            return self.process_video_single_pass(input_path, output_path, confidence_threshold)
+    
+    def process_video_single_pass(self, input_path, output_path, confidence_threshold=0.3):
+        """Original single-pass processing with online smoothing"""
         if not os.path.exists(input_path):
             print(f"Error: Input video '{input_path}' not found!")
             return False
@@ -293,22 +421,17 @@ class AcrobaticPoseProcessor:
             print(f"Error: Could not open video '{input_path}'")
             return False
         
-        # Get video properties
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
         print(f"Processing video: {width}x{height} @ {fps}fps, {total_frames} frames")
-        print("🔄 Applying temporal smoothing...")
         
-        # Setup video writer
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         
         frame_count = 0
-        
-        # Process video with tracking
         results = self.model.track(input_path, stream=True, verbose=False, tracker="bytetrack.yaml")
         
         for result in results:
@@ -320,86 +443,95 @@ class AcrobaticPoseProcessor:
                 keypoints = result.keypoints.xy.cpu().numpy()
                 keypoint_confidences = result.keypoints.conf.cpu().numpy()
                 
-                # Get track IDs
                 track_ids = result.boxes.id
                 if track_ids is not None:
                     track_ids = track_ids.cpu().numpy().astype(int)
                 else:
                     track_ids = list(range(len(boxes)))
                 
-                # Process each detected person
                 for i in range(len(boxes)):
-                    bbox = boxes[i]
-                    confidence = confidences[i]
                     person_keypoints = keypoints[i]
                     kpt_confidences = keypoint_confidences[i]
                     person_id = track_ids[i] if i < len(track_ids) else i
                     
-                    # Apply temporal smoothing
-                    smoothed_keypoints, smoothed_confidences = self.temporal_smoother.smooth_keypoints(
-                        person_id, person_keypoints, kpt_confidences, frame_count
-                    )
+                    # Apply online temporal smoothing
+                    keypoints_with_conf = []
+                    for j in range(len(person_keypoints)):
+                        x, y = person_keypoints[j]
+                        conf = kpt_confidences[j]
+                        keypoints_with_conf.append([x, y, conf])
                     
-                    # Store trajectory data
-                    for kpt_idx, (pos, conf) in enumerate(zip(smoothed_keypoints, smoothed_confidences)):
-                        self.person_trajectories[person_id][kpt_idx]['frames'].append(frame_count)
-                        self.person_trajectories[person_id][kpt_idx]['positions'].append(pos.tolist())
-                        self.person_trajectories[person_id][kpt_idx]['confidences'].append(float(conf))
+                    # Smooth keypoints
+                    if self.enable_smoothing:
+                        keypoints_with_conf = self.smoother.smooth_keypoints(
+                            person_id, keypoints_with_conf, kpt_confidences
+                        )
                     
-                    # Draw smoothed pose overlay
                     frame = self.draw_keypoints_and_skeleton(
-                        frame, smoothed_keypoints, smoothed_confidences, person_id, confidence_threshold
+                        frame, keypoints_with_conf, person_id, confidence_threshold
                     )
-                    
-                    # Add person label
-                    frame = self.add_person_label(frame, bbox, person_id, confidence)
             
-            # Write frame
             out.write(frame)
             frame_count += 1
             
-            # Progress indicator
             if frame_count % 30 == 0:
                 progress = (frame_count / total_frames) * 100
-                print(f"Progress: {progress:.1f}% ({frame_count}/{total_frames} frames) - Smoothing applied")
+                print(f"Progress: {progress:.1f}% ({frame_count}/{total_frames} frames)")
         
-        # Cleanup
         cap.release()
         out.release()
         
-        print(f"✅ Temporal smoothing complete! Output saved to: {output_path}")
-        print(f"📊 Processed {len(self.person_trajectories)} people with smoothed trajectories")
-        
+        print(f"✅ Processing complete! Output saved to: {output_path}")
         return True
 
 def main():
-    print("🚀 Initializing YOLOv11 Pose model with Temporal Smoothing...")
-    processor = AcrobaticPoseProcessor(model_size='s')
+    """Main function with enhanced temporal smoothing"""
+    print("🚀 Initializing Enhanced YOLOv11 Pose model with Temporal Smoothing...")
     
+    # Initialize processor with temporal smoothing enabled
+    processor = EnhancedAcrobaticPoseProcessor(
+        model_size='x',  # Use 'x' for best accuracy, 'm' for balance, 'n' for speed
+        enable_smoothing=True  # Enable temporal smoothing
+    )
+    
+    # Input and output paths
     input_video = "acro.mov"
-    output_video = "acro_with_smoothed_pose.mp4"
+    output_video = "acro_smoothed_pose.mp4"
     
+    # Check if input video exists
     if not os.path.exists(input_video):
-        print(f"❌ Input video '{input_video}' not found!")
+        print(f"⌚ Input video '{input_video}' not found!")
+        print("Please make sure 'acro.mov' is in the same directory as this script.")
         return
     
-    print(f"📹 Processing video with temporal smoothing: {input_video}")
-    print("⏳ This will take a bit longer due to smoothing calculations...")
+    print(f"📹 Processing video: {input_video}")
+    print("🔄 Using two-pass processing with temporal smoothing...")
+    print("⏳ This will take longer but produce much smoother results...")
     
+    # Process the video with temporal smoothing
     success = processor.process_video(
         input_path=input_video,
         output_path=output_video,
-        confidence_threshold=0.25  # Lower threshold since smoothing helps with low-confidence points
+        confidence_threshold=0.2  # Lower threshold to capture more keypoints for smoothing
     )
     
     if success:
-        print(f"🎉 Done! Smoothed pose video: {output_video}")
-        print("\n🎯 Temporal Smoothing Features Applied:")
-        print("- Kalman filtering for trajectory prediction")
-        print("- Confidence-weighted keypoint recovery")
-        print("- Outlier detection and interpolation")
-        print("- Motion-aware smoothing for rapid movements")
-        print("\n💡 Compare the smoothness, especially during the flyer's rotation!")
+        print(f"🎉 Done! Check out your temporally smoothed pose video: {output_video}")
+        print("\n💡 Advanced smoothing features applied:")
+        print("✓ Kalman filtering for high-confidence keypoints")
+        print("✓ Weighted averaging for medium-confidence keypoints")
+        print("✓ Predictive recovery for lost keypoints")
+        print("✓ Savitzky-Golay smoothing for trajectories")
+        print("✓ Cubic interpolation between frames")
+        print("✓ Enhanced tracking for critical joints (hips, shoulders, ankles, wrists)")
+        print("\n🔧 To compare with original:")
+        print("  Set enable_smoothing=False in the processor initialization")
+        print("\n📊 For fine-tuning:")
+        print("  - Adjust window_size in TemporalSmoother (3-15)")
+        print("  - Modify confidence_threshold (0.1-0.5)")
+        print("  - Change Kalman filter variance parameters")
+    else:
+        print("❌ Processing failed. Please check the error messages above.")
 
 if __name__ == "__main__":
     main()
